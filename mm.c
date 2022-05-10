@@ -65,6 +65,16 @@ team_t team = {
 #define NEXT_BLKP(bp)   ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))   /* 다음 블록의 playload 시작 위치 */
 #define PREV_BLKP(bp)   ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))   /* 이전 블록의 playload 시작 위치 */
 
+#define PUT_P(p, val) (*(unsigned int *) (p) = (int)(val))
+
+#define PREV_FREE_BLKP(ptr) (*(void **) (ptr))                              /* ptr의 prev */
+#define NEXT_FREE_BLKP(ptr) (*(void **) (ptr + WSIZE))                      /* ptr의 next */
+
+#define SET_PREV_FREE(bp, prev) (*((void **)(bp)) = prev)                   /* ptr의 prev에 값 세팅 */
+#define SET_NEXT_FREE(bp, next) (*((void **)(bp + WSIZE)) = next)           /* ptr의 next에 값 세팅 */
+
+static void insert(void *ptr);
+static void delete(void *ptr);
 static void *extend_heap(size_t words);         /* 새 가용 블록으로 힙 확장 */
 static void *coalesce(void *ptr);               /* 인접 가용 블록들과 통합 */
 static void *find_fit(size_t asize);            /* 가용 리스트를 처음부터 검색해서 크기가 맞는 첫 번째 가용 블록을 선택 */
@@ -72,7 +82,7 @@ static void place(void *ptr, size_t asize);     /* 가용 공간과 할당할 �
                                                 넣어주고 공간 할당을 하고 남은 부분이 있으면 
                                                 (넣어줄 가용 블록 크기 - 할당할 크기)만큼을 가용공간으로 만듬 */
 
-static char *heap_listp = NULL;                 /* find_fit에서 사용하기 위한 정적 전역 변수 */
+static char *heap_listp;                 /* find_fit에서 사용하기 위한 정적 전역 변수 */
 
 /* 
  * mm_init - malloc 초기화.
@@ -80,13 +90,15 @@ static char *heap_listp = NULL;                 /* find_fit에서 사용하기 �
 int mm_init(void)
 {
     /* 최소 16바이트(header, footer, playlog)을 할당해야되는데 전체로 봤을 때 16바이트를 할당할 수 없으면 return -1 */
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) {
+    if ((heap_listp = mem_sbrk(6*WSIZE)) == (void *)-1) {
         return -1;
     }
     PUT(heap_listp, 0);                             /* Alignment 패딩, Epilogue의 헤더는 4바이트이므로 8바이트를 맞추기 위해 맨 앞에 4바이트에 0으로 패딩 */
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));    /* Prologue 헤더 */
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));    /* Prologue 푸터 */
-    PUT(heap_listp + (3*WSIZE), PACK(0, 1));        /* Epilogue 헤더 */
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE*2, 1));  /* Prologue 헤더 */
+    PUT_P(heap_listp + (2*WSIZE), NULL);              /* prev */
+    PUT_P(heap_listp + (3*WSIZE), NULL);              /* next */
+    PUT(heap_listp + (4*WSIZE), PACK(DSIZE*2, 1));  /* Prologue 푸터 */
+    PUT(heap_listp + (5*WSIZE), PACK(0, 1));        /* Epilogue 헤더 */
     heap_listp += (2*WSIZE);                        /* heap_listp위치를 footer의 위치로 이동, find_fit에서 처음 위치를 가리키는 용도로 사용 */
 
     /* CHUNKSIZE: (1<<12) = 4096, 초기에 가용블록으로 힙을 확장 시도, 만약에 4096바이트를 확장 시켜줄 공간이 없다면 return -1, 있다면 공간 확장*/
@@ -117,7 +129,7 @@ static void *extend_heap(size_t words) {
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
     PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));
-
+    
     /* 새 가용 블록으로 힙을 확장하고 이전 블록이 가용블록이면 합침 */
     return coalesce(ptr);
 }
@@ -174,9 +186,9 @@ static void *find_fit(size_t asize) {
     /* ptr = heap_listp(즉, init에서 설정했던 Prologue); 
     조건은 블록의 크기가 0보다 클 때(즉, Epilogue를 만날 때 까지)반복
     실행이 끝나면 ptr = 다음 블록의 payload 시작 위치 */
-    for(ptr = heap_listp; GET_SIZE(HDRP(ptr)) > 0; ptr = NEXT_BLKP(ptr)) {
+    for(ptr = NEXT_FREE_BLKP(heap_listp); ptr != NULL; ptr = NEXT_FREE_BLKP(ptr)) {
         /* 현재 블록이 가용 블록이고, 할당하고 싶은 사이즈 보다 현재 블록이 더 클 때 포인터 반환 */
-        if(!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
+        if(asize <= GET_SIZE(HDRP(ptr))) {
             return ptr;
         }
     }
@@ -193,7 +205,7 @@ static void *find_fit(size_t asize) {
 */
 static void place(void *ptr, size_t asize) {
     size_t csize = GET_SIZE(HDRP(ptr));         /* 현재 블록의 크기 */
-
+    delete(ptr);
     /* 만약 할당할 크기를 담을 수 있는 블록 - 할당할 블록이 16바이트보다 크면 */
     /* 앞의 공간은 할당하고 남은 공간은 가용 블록으로 만들어 줌*/
     /* 아니면 */
@@ -204,6 +216,7 @@ static void place(void *ptr, size_t asize) {
         ptr = NEXT_BLKP(ptr);
         PUT(HDRP(ptr), PACK(csize - asize, 0));
         PUT(FTRP(ptr), PACK(csize - asize, 0));
+        insert(ptr);
     } else {
         PUT(HDRP(ptr), PACK(csize, 1));
         PUT(FTRP(ptr), PACK(csize, 1));
@@ -231,24 +244,27 @@ static void *coalesce(void *ptr) {
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));    /* 다음 블록이 가용상태인지 확인 */
     size_t size = GET_SIZE(HDRP(ptr));
 
-    if (prev_alloc && next_alloc) {                         /* 양쪽다 가용 상태가 아니라면 ptr를 반환 */
-        return ptr;
-    } else if (prev_alloc && !next_alloc) {                 /* 다음 블록이 가용상태이고 이전 블록이 가용 상태가 아니라면 */
-        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));                 /* 다음 블록의 크기를 size에 더해줌 */
-        PUT(HDRP(ptr), PACK(size, 0));                          /* 현재 header에 size를 넣고 가용상태로 만들어줌 */
-        PUT(FTRP(ptr), PACK(size, 0));                          /* FTRP는 bp + 현재 header의 크기 - 8을 한 곳(즉, 다음 블록의 footer)에 size를 넣고 가용상태로 만들어줌 */ 
-    } else if (!prev_alloc && next_alloc) {                 /* 이전 블록이 가용상태이고 다음 블록이 가용 상태가 아니라면 */
-        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));                 /* 이전 블록의 크기를 size에 더해줌 */
-        PUT(FTRP(ptr), PACK(size, 0));                          /* 현재 footer에 size를 넣고 가용상태로 만들어줌 */
-        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));               /* 이전 블록의 header에 size를 넣고 가용상태로 만들어줌 */
-        ptr = PREV_BLKP(ptr);                                   /* 이전 블록의 payload 시작 위치를 ptr에 담음 */
-    } else {                                                                        /* 이전 블록과 다음 블록이 둘다 사용 상태일 때 */
+    if (prev_alloc && !next_alloc) {                                                /* 다음 블록이 가용상태이고 이전 블록이 가용 상태가 아니라면 */
+        delete(NEXT_BLKP(ptr));
+        size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));                                         /* 다음 블록의 크기를 size에 더해줌 */
+        PUT(HDRP(ptr), PACK(size, 0));                                                  /* 현재 header에 size를 넣고 가용상태로 만들어줌 */
+        PUT(FTRP(ptr), PACK(size, 0));                                                  /* FTRP는 bp + 현재 header의 크기 - 8을 한 곳(즉, 다음 블록의 footer)에 size를 넣고 가용상태로 만들어줌 */ 
+    } else if (!prev_alloc && next_alloc) {                                         /* 이전 블록이 가용상태이고 다음 블록이 가용 상태가 아니라면 */
+        delete(PREV_BLKP(ptr));
+        size += GET_SIZE(HDRP(PREV_BLKP(ptr)));                                         /* 이전 블록의 크기를 size에 더해줌 */
+        PUT(FTRP(ptr), PACK(size, 0));                                                  /* 현재 footer에 size를 넣고 가용상태로 만들어줌 */
+        PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));                                       /* 이전 블록의 header에 size를 넣고 가용상태로 만들어줌 */
+        ptr = PREV_BLKP(ptr);                                                           /* 이전 블록의 payload 시작 위치를 ptr에 담음 */
+    } else if (!prev_alloc && !next_alloc) {                                        /* 이전 블록과 다음 블록이 둘다 사용 상태일 때 */
+        delete(NEXT_BLKP(ptr));
+        delete(PREV_BLKP(ptr));
         size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(FTRP(NEXT_BLKP(ptr)));        /* 이전 블록과 다음블록의 크기를 size에 더해줌*/
         PUT(HDRP(PREV_BLKP(ptr)), PACK(size, 0));                                       /* 이전 블록의 header에 size를 넣어줌 */
         PUT(FTRP(NEXT_BLKP(ptr)), PACK(size, 0));                                       /* 다음 블록의 footer에 size를 넣어줌 */
         ptr = PREV_BLKP(ptr);                                                           /* 이전 블록의 payload 시작 위치를 ptr에 담음 */
     }
-    return ptr; /* ptr 반환 */
+    insert(ptr);
+    return ptr;                                                                     /* ptr 반환 */
 }
 
 /*
@@ -281,3 +297,28 @@ void *mm_realloc(void *bp, size_t size)
     mm_free(bp);                /* 기존의 메모리 free */
     return newp;
 }
+
+static void insert(void *ptr) {
+    if (NEXT_FREE_BLKP(heap_listp) != NULL) {
+        SET_NEXT_FREE(ptr, NEXT_FREE_BLKP(heap_listp));
+        SET_PREV_FREE(NEXT_FREE_BLKP(heap_listp), ptr);
+        
+    } else {
+        SET_NEXT_FREE(ptr, NULL);
+    }
+
+    SET_NEXT_FREE(heap_listp, ptr);
+    SET_PREV_FREE(ptr, heap_listp);
+}
+
+static void delete(void *ptr) {
+    void *prev = PREV_FREE_BLKP(ptr);
+    void *next = NEXT_FREE_BLKP(ptr);
+    if (NEXT_FREE_BLKP(ptr) != NULL) {
+        SET_NEXT_FREE(prev, next);
+        SET_PREV_FREE(next, prev);
+    } else {
+        SET_NEXT_FREE(PREV_FREE_BLKP(ptr), NULL);
+    }
+}
+
